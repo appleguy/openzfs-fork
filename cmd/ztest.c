@@ -9081,6 +9081,8 @@ make_random_pool_props(void)
  * Create a storage pool with the given name and initial vdev size.
  * Then test spa_freeze() functionality.
  */
+extern uint64_t ztest_avz_fault_object;
+
 static void
 ztest_init(ztest_shared_t *zs)
 {
@@ -9113,7 +9115,10 @@ ztest_init(ztest_shared_t *zs)
 	 */
 	fnvlist_add_uint64(props,
 	    zpool_prop_to_name(ZPOOL_PROP_FAILUREMODE),
-	    MAXFAULTS(zs) ? ZIO_FAILURE_MODE_PANIC : ZIO_FAILURE_MODE_WAIT);
+	    getenv("ZTEST_AVZ_SCENARIO") != NULL ?
+	    ZIO_FAILURE_MODE_CONTINUE :
+	    (MAXFAULTS(zs) ? ZIO_FAILURE_MODE_PANIC :
+	    ZIO_FAILURE_MODE_WAIT));
 
 	/*
 	 * Set the multihost property at creation time under -M so that every
@@ -9130,7 +9135,9 @@ ztest_init(ztest_shared_t *zs)
 	for (i = 0; i < SPA_FEATURES; i++) {
 		char *buf;
 
-		if (!spa_feature_table[i].fi_zfs_mod_supported)
+		if (!spa_feature_table[i].fi_zfs_mod_supported ||
+		    (getenv("ZTEST_AVZ_SCENARIO") != NULL &&
+		    i == SPA_FEATURE_AVZ_V2))
 			continue;
 
 		/*
@@ -9160,6 +9167,61 @@ ztest_init(ztest_shared_t *zs)
 
 	VERIFY0(spa_open(ztest_opts.zo_pool, &spa, FTAG));
 	ztest_spa = spa;
+	if (getenv("ZTEST_AVZ_SCENARIO") != NULL) {
+		nvlist_t *features = fnvlist_alloc();
+		VERIFY3U(spa->spa_root_vdev->vdev_root_zap, ==, 0);
+		VERIFY(!spa_feature_is_enabled(spa, SPA_FEATURE_AVZ_V2));
+		fnvlist_add_uint64(features, "feature@vdev_zaps_v2", 0);
+		int error = spa_prop_set(spa, features);
+		fnvlist_free(features);
+		VERIFY0(error);
+		VERIFY(spa_feature_is_enabled(spa, SPA_FEATURE_AVZ_V2));
+		VERIFY(!spa_feature_is_active(spa, SPA_FEATURE_AVZ_V2));
+		const char *scenario = getenv("ZTEST_AVZ_SCENARIO");
+		boolean_t fault = strcmp(scenario, "healthy") != 0;
+		VERIFY(!fault || strcmp(scenario, "fault") == 0 ||
+		    strcmp(scenario, "remove") == 0 ||
+		    strcmp(scenario, "write") == 0);
+		vdev_t *leaf = spa->spa_root_vdev->vdev_child[0];
+		while (!leaf->vdev_ops->vdev_op_leaf)
+			leaf = leaf->vdev_child[0];
+		spa_config_enter(spa, SCL_STATE, FTAG, RW_WRITER);
+		if (fault) {
+			leaf->vdev_cant_read = strcmp(scenario, "fault") == 0;
+			leaf->vdev_cant_write = strcmp(scenario, "write") == 0;
+			leaf->vdev_remove_wanted = strcmp(scenario, "remove") == 0;
+			ztest_avz_fault_object = spa->spa_all_vdev_zaps;
+		}
+		vdev_state_dirty(spa->spa_root_vdev->vdev_child[0]);
+		spa_config_exit(spa, SCL_STATE, FTAG);
+		txg_wait_synced(spa_get_dsl(spa), 0);
+		if (fault) {
+			VERIFY(!spa_feature_is_active(spa, SPA_FEATURE_AVZ_V2));
+			VERIFY3U(spa->spa_root_vdev->vdev_root_zap, ==, 0);
+			VERIFY3U(ztest_avz_fault_object, ==,
+			    spa->spa_all_vdev_zaps);
+			(void) printf("AVZ_FAULT_TEST_DEFERRED_PASS mode=%s\n",
+			    scenario);
+			spa_config_enter(spa, SCL_STATE, FTAG, RW_WRITER);
+			leaf->vdev_cant_read = B_FALSE;
+			leaf->vdev_cant_write = B_FALSE;
+			leaf->vdev_remove_wanted = B_FALSE;
+			ztest_avz_fault_object = 0;
+			vdev_state_dirty(spa->spa_root_vdev->vdev_child[0]);
+			spa_config_exit(spa, SCL_STATE, FTAG);
+			txg_wait_synced(spa_get_dsl(spa), 0);
+		}
+		VERIFY(spa_feature_is_active(spa, SPA_FEATURE_AVZ_V2));
+		VERIFY3U(spa->spa_root_vdev->vdev_root_zap, !=, 0);
+		VERIFY0(zap_lookup_int(spa->spa_meta_objset,
+		    spa->spa_all_vdev_zaps,
+		    spa->spa_root_vdev->vdev_root_zap));
+		(void) printf("AVZ_FAULT_TEST_HEALTHY_PASS root_zap=%llu\n",
+		    (unsigned long long)spa->spa_root_vdev->vdev_root_zap);
+		spa_close(spa, FTAG);
+		kernel_fini();
+		return;
+	}
 	ztest_dmu_sync_blocksize_tests(spa);
 	zs->zs_metaslab_sz =
 	    1ULL << spa->spa_root_vdev->vdev_child[0]->vdev_ms_shift;
@@ -9532,6 +9594,11 @@ main(int argc, char **argv)
 		VERIFY(!exec_child(NULL, NULL, B_FALSE, NULL));
 	}
 	zs->zs_do_init = B_FALSE;
+
+	if (getenv("ZTEST_AVZ_SCENARIO") != NULL) {
+		(void) printf("AVZ_FAULT_TEST_FOCUSED_INIT_DONE\n");
+		return (0);
+	}
 
 	zs->zs_proc_start = gethrtime();
 	zs->zs_proc_stop = zs->zs_proc_start + ztest_opts.zo_time * NANOSEC;
