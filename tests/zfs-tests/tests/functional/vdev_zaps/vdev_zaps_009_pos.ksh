@@ -24,6 +24,9 @@ function cleanup
 log_assert "Root-vdev ZAP activation defers on unavailable vdevs and retries"
 log_onexit cleanup
 
+# ztest may re-exec itself by basename, including via a libtool wrapper.
+log_must cd "$(dirname "$ZTEST_BIN")"
+
 for scenario in healthy fault remove write; do
     workdir="$ZTEST_AVZ_DIR/$scenario"
     logfile="$ZTEST_AVZ_DIR/$scenario.log"
