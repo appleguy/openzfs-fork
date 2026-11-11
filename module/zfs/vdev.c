@@ -3745,30 +3745,17 @@ vdev_destroy_unlink_zap(vdev_t *vd, uint64_t zapobj, dmu_tx_t *tx)
 	    zapobj, tx));
 }
 
-static int
-vdev_create_link_zap_impl(vdev_t *vd, dmu_tx_t *tx, uint64_t *zapp)
+uint64_t
+vdev_create_link_zap(vdev_t *vd, dmu_tx_t *tx)
 {
 	spa_t *spa = vd->vdev_spa;
 	uint64_t zap = zap_create(spa->spa_meta_objset, DMU_OTN_ZAP_METADATA,
 	    DMU_OT_NONE, 0, tx);
 
 	ASSERT(zap != 0);
-	int error = zap_add_int(spa->spa_meta_objset, spa->spa_all_vdev_zaps,
-	    zap, tx);
-	if (error != 0) {
-		/* Never leave a newly allocated, unlinked ZAP behind. */
-		VERIFY0(zap_destroy(spa->spa_meta_objset, zap, tx));
-		return (error);
-	}
-	*zapp = zap;
-	return (0);
-}
+	VERIFY0(zap_add_int(spa->spa_meta_objset, spa->spa_all_vdev_zaps,
+	    zap, tx));
 
-uint64_t
-vdev_create_link_zap(vdev_t *vd, dmu_tx_t *tx)
-{
-	uint64_t zap = 0;
-	VERIFY0(vdev_create_link_zap_impl(vd, tx, &zap));
 	return (zap);
 }
 
@@ -3818,25 +3805,18 @@ vdev_construct_zaps(vdev_t *vd, dmu_tx_t *tx)
 		/*
 		 * Do not begin optional first-time initialization while a
 		 * device is inaccessible.  The feature stays enabled but
-		 * inactive until a later healthy config sync/import.  If the
-		 * feature is already active, this is not optional.
+		 * inactive until a later healthy config sync/import.  On a
+		 * degraded pool, root-vdev properties remain unavailable
+		 * (EINVAL) until initialization, as before the upgrade.
+		 * If the feature is already active, this is not optional.
 		 */
 		boolean_t active = spa_feature_is_active(vd->vdev_spa,
 		    SPA_FEATURE_AVZ_V2);
 		if (active || vdev_tree_usable_for_root_zap(vd)) {
-			uint64_t zap = 0;
-			int error = vdev_create_link_zap_impl(vd, tx, &zap);
-			if (error == ENXIO && !active) {
-				/* Retry when available. */
-				vdev_dbgmsg(vd,
-				    "deferring root ZAP after ENXIO");
-			} else {
-				VERIFY0(error);
-				if (!active)
-					spa_feature_incr(vd->vdev_spa,
-					    SPA_FEATURE_AVZ_V2, tx);
-				vd->vdev_root_zap = zap;
-			}
+			if (!active)
+				spa_feature_incr(vd->vdev_spa,
+				    SPA_FEATURE_AVZ_V2, tx);
+			vd->vdev_root_zap = vdev_create_link_zap(vd, tx);
 		}
 	}
 

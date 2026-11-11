@@ -943,21 +943,9 @@ zap_value_search_by_dnode(dnode_t *dn, uint64_t value, uint64_t mask,
 	char name[20];			\
 	(void) snprintf(name, sizeof (name), "%llx", (longlong_t)value);
 
-#ifdef LIB_ZPOOL_BUILD
-/* Fault injection confined to the userland libzpool test library. */
-uint64_t ztest_avz_fault_object;
-#endif
-
 int
 zap_add_int(objset_t *os, uint64_t obj, uint64_t value, dmu_tx_t *tx)
 {
-#ifdef LIB_ZPOOL_BUILD
-	if (ztest_avz_fault_object != 0 &&
-	    obj == ztest_avz_fault_object) {
-		ztest_avz_fault_object = 0;
-		return (SET_ERROR(ENXIO));
-	}
-#endif
 	FORMAT_INT_KEY(name, value);
 	return (zap_add(os, obj, name, 8, 1, &value, tx));
 }

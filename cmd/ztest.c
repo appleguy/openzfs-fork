@@ -9081,8 +9081,6 @@ make_random_pool_props(void)
  * Create a storage pool with the given name and initial vdev size.
  * Then test spa_freeze() functionality.
  */
-extern uint64_t ztest_avz_fault_object;
-
 static void
 ztest_init(ztest_shared_t *zs)
 {
@@ -9181,8 +9179,7 @@ ztest_init(ztest_shared_t *zs)
 		boolean_t fault = strcmp(scenario, "healthy") != 0;
 		VERIFY(!fault || strcmp(scenario, "fault") == 0 ||
 		    strcmp(scenario, "remove") == 0 ||
-		    strcmp(scenario, "write") == 0 ||
-		    strcmp(scenario, "late") == 0);
+		    strcmp(scenario, "write") == 0);
 		vdev_t *leaf = spa->spa_root_vdev->vdev_child[0];
 		while (!leaf->vdev_ops->vdev_op_leaf)
 			leaf = leaf->vdev_child[0];
@@ -9192,26 +9189,19 @@ ztest_init(ztest_shared_t *zs)
 			leaf->vdev_cant_write = strcmp(scenario, "write") == 0;
 			leaf->vdev_remove_wanted =
 			    strcmp(scenario, "remove") == 0;
-			ztest_avz_fault_object = spa->spa_all_vdev_zaps;
 		}
 		vdev_state_dirty(spa->spa_root_vdev->vdev_child[0]);
 		spa_config_exit(spa, SCL_STATE, FTAG);
 		txg_wait_synced(spa_get_dsl(spa), 0);
-		if (strcmp(scenario, "late") == 0) {
-			VERIFY3U(ztest_avz_fault_object, ==, 0);
-			(void) printf("AVZ_FAULT_TEST_LATE_RETRY_PASS\n");
-		} else if (fault) {
+		if (fault) {
 			VERIFY(!spa_feature_is_active(spa, SPA_FEATURE_AVZ_V2));
 			VERIFY3U(spa->spa_root_vdev->vdev_root_zap, ==, 0);
-			VERIFY3U(ztest_avz_fault_object, ==,
-			    spa->spa_all_vdev_zaps);
 			(void) printf("AVZ_FAULT_TEST_DEFERRED_PASS mode=%s\n",
 			    scenario);
 			spa_config_enter(spa, SCL_STATE, FTAG, RW_WRITER);
 			leaf->vdev_cant_read = B_FALSE;
 			leaf->vdev_cant_write = B_FALSE;
 			leaf->vdev_remove_wanted = B_FALSE;
-			ztest_avz_fault_object = 0;
 			vdev_state_dirty(spa->spa_root_vdev->vdev_child[0]);
 			spa_config_exit(spa, SCL_STATE, FTAG);
 			txg_wait_synced(spa_get_dsl(spa), 0);

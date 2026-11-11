@@ -3,8 +3,8 @@
 #
 # Copyright (c) 2026, OpenZFS contributors.
 #
-# Exercise the libzpool-only root-ZAP ENXIO fault injector with disposable
-# file-backed ztest pools.  No real disks or kernel pools are used.
+# Exercise root-ZAP activation with missing or unavailable vdevs in
+# disposable file-backed ztest pools.  No physical disks are used.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -24,7 +24,7 @@ function cleanup
 log_assert "Root-vdev ZAP activation defers on unavailable vdevs and retries"
 log_onexit cleanup
 
-for scenario in healthy fault remove write late; do
+for scenario in healthy fault remove write; do
     workdir="$ZTEST_AVZ_DIR/$scenario"
     logfile="$ZTEST_AVZ_DIR/$scenario.log"
     log_must mkdir -p "$workdir"
@@ -32,9 +32,7 @@ for scenario in healthy fault remove write late; do
         -T 1 -P 1 -k 0 -v 1 -m 2 -r 2 -K raidz -d 1 -t 1 -s 64M \
         -p "ztestavz${scenario}$$" -f "$workdir" > "$logfile" 2>&1
     log_must grep -q 'AVZ_FAULT_TEST_HEALTHY_PASS' "$logfile"
-    if [[ "$scenario" == late ]]; then
-        log_must grep -q "AVZ_FAULT_TEST_LATE_RETRY_PASS" "$logfile"
-    elif [[ "$scenario" != healthy ]]; then
+    if [[ "$scenario" != healthy ]]; then
         log_must grep -q "AVZ_FAULT_TEST_DEFERRED_PASS mode=$scenario" \
             "$logfile"
     fi
