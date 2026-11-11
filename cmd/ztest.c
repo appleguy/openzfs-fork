@@ -9177,18 +9177,25 @@ ztest_init(ztest_shared_t *zs)
 		VERIFY(!spa_feature_is_active(spa, SPA_FEATURE_AVZ_V2));
 		const char *scenario = getenv("ZTEST_AVZ_SCENARIO");
 		boolean_t fault = strcmp(scenario, "healthy") != 0;
+		boolean_t ordered = strcmp(scenario, "ordered") == 0;
 		VERIFY(!fault || strcmp(scenario, "fault") == 0 ||
 		    strcmp(scenario, "remove") == 0 ||
-		    strcmp(scenario, "write") == 0);
+		    strcmp(scenario, "write") == 0 || ordered);
 		vdev_t *leaf = spa->spa_root_vdev->vdev_child[0];
 		while (!leaf->vdev_ops->vdev_op_leaf)
 			leaf = leaf->vdev_child[0];
+		vdev_t *peer = NULL;
+		if (ordered) {
+			VERIFY3U(leaf->vdev_parent->vdev_children, >=, 2);
+			peer = leaf->vdev_parent->vdev_child[1];
+			VERIFY(peer->vdev_ops->vdev_op_leaf);
+		}
 		spa_config_enter(spa, SCL_STATE, FTAG, RW_WRITER);
 		if (fault) {
 			leaf->vdev_cant_read = strcmp(scenario, "fault") == 0;
 			leaf->vdev_cant_write = strcmp(scenario, "write") == 0;
 			leaf->vdev_remove_wanted =
-			    strcmp(scenario, "remove") == 0;
+			    strcmp(scenario, "remove") == 0 || ordered;
 		}
 		vdev_state_dirty(spa->spa_root_vdev->vdev_child[0]);
 		spa_config_exit(spa, SCL_STATE, FTAG);
@@ -9196,12 +9203,39 @@ ztest_init(ztest_shared_t *zs)
 		if (fault) {
 			VERIFY(!spa_feature_is_active(spa, SPA_FEATURE_AVZ_V2));
 			VERIFY3U(spa->spa_root_vdev->vdev_root_zap, ==, 0);
+			if (ordered) {
+				/* Second device disappears in the next sync. */
+				spa_config_enter(spa, SCL_STATE, FTAG,
+				    RW_WRITER);
+				peer->vdev_remove_wanted = B_TRUE;
+				vdev_state_dirty(leaf->vdev_top);
+				spa_config_exit(spa, SCL_STATE, FTAG);
+				txg_wait_synced(spa_get_dsl(spa), 0);
+				VERIFY(!spa_feature_is_active(spa,
+				    SPA_FEATURE_AVZ_V2));
+				VERIFY3U(spa->spa_root_vdev->vdev_root_zap,
+				    ==, 0);
+				/* Only the first disk returns. */
+				spa_config_enter(spa, SCL_STATE, FTAG,
+				    RW_WRITER);
+				leaf->vdev_remove_wanted = B_FALSE;
+				vdev_state_dirty(leaf->vdev_top);
+				spa_config_exit(spa, SCL_STATE, FTAG);
+				txg_wait_synced(spa_get_dsl(spa), 0);
+				VERIFY(!spa_feature_is_active(spa,
+				    SPA_FEATURE_AVZ_V2));
+				VERIFY3U(spa->spa_root_vdev->vdev_root_zap,
+				    ==, 0);
+				(void) printf("AVZ_ORDERED_REMOVAL_PASS\n");
+			}
 			(void) printf("AVZ_FAULT_TEST_DEFERRED_PASS mode=%s\n",
 			    scenario);
 			spa_config_enter(spa, SCL_STATE, FTAG, RW_WRITER);
 			leaf->vdev_cant_read = B_FALSE;
 			leaf->vdev_cant_write = B_FALSE;
 			leaf->vdev_remove_wanted = B_FALSE;
+			if (ordered)
+				peer->vdev_remove_wanted = B_FALSE;
 			vdev_state_dirty(spa->spa_root_vdev->vdev_child[0]);
 			spa_config_exit(spa, SCL_STATE, FTAG);
 			txg_wait_synced(spa_get_dsl(spa), 0);

@@ -36,7 +36,7 @@ log_onexit cleanup
 # ztest may re-exec itself by basename, including via a libtool wrapper.
 log_must cd "$(dirname "$ZTEST_BIN")"
 
-for scenario in healthy fault remove write; do
+for scenario in healthy fault remove write ordered; do
     workdir="$ZTEST_AVZ_DIR/$scenario"
     logfile="$ZTEST_AVZ_DIR/$scenario.log"
     log_must mkdir -p "$workdir"
@@ -47,6 +47,9 @@ for scenario in healthy fault remove write; do
     if [[ "$scenario" != healthy ]]; then
         log_must grep -q "AVZ_FAULT_TEST_DEFERRED_PASS mode=$scenario" \
             "$logfile"
+    fi
+    if [[ "$scenario" == ordered ]]; then
+        log_must grep -q 'AVZ_ORDERED_REMOVAL_PASS' "$logfile"
     fi
 done
 
