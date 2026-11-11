@@ -282,6 +282,7 @@ extern uint64_t vdev_anyraid_min_tile_size;
 
 static ztest_shared_opts_t *ztest_shared_opts;
 static ztest_shared_opts_t ztest_opts;
+static boolean_t ztest_vdev_zaps_test;
 static const char *const ztest_wkeydata = "abcdefghijklmnopqrstuvwxyz012345";
 
 typedef struct ztest_shared_ds {
@@ -796,6 +797,9 @@ static ztest_option_t option_table[] = {
 	    NO_DEFAULT, NULL},
 	{ 'C',	"vdev-class-state", "on|off|random", "vdev class state",
 	    NO_DEFAULT, "random"},
+	{ 'Z', "vdev-zaps", NULL,
+	    "Test root-ZAP activation with unavailable vdevs",
+	    NO_DEFAULT, NULL},
 	{ 'X', "raidz-expansion", NULL,
 	    "Perform a dedicated raidz expansion test",
 	    NO_DEFAULT, NULL},
@@ -1240,6 +1244,9 @@ process_options(int argc, char **argv)
 		case 'V':
 			zo->zo_verbose++;
 			break;
+		case 'Z':
+			ztest_vdev_zaps_test = B_TRUE;
+			break;
 		case 'X':
 			zo->zo_raidz_expand_test = RAIDZ_EXPAND_REQUESTED;
 			break;
@@ -1320,6 +1327,17 @@ process_options(int argc, char **argv)
 	}
 
 	fini_options();
+
+	/* Keep one mirror member available throughout the focused test. */
+	if (ztest_vdev_zaps_test) {
+		if (zo->zo_init == 0 || zo->zo_alt_ztest[0] != 0 ||
+		    zo->zo_mmp_test ||
+		    zo->zo_raidz_expand_test != RAIDZ_EXPAND_NONE)
+			usage(B_FALSE);
+		zo->zo_mirrors = 3;
+		zo->zo_raid_children = 1;
+		raid_kind = "raidz";
+	}
 
 	/* Force compatible options for raidz expansion run */
 	if (zo->zo_raidz_expand_test == RAIDZ_EXPAND_REQUESTED) {
@@ -9077,6 +9095,58 @@ make_random_pool_props(void)
 	return (props);
 }
 
+/* Exercise the guard through real vdev state, without hooks in ZAP code. */
+static void
+ztest_vdev_zaps(spa_t *spa)
+{
+	enum { CANT_READ = 1, CANT_WRITE = 2, REMOVE = 4, REMOVE_PEER = 8 };
+	const uint_t states[] = {
+		CANT_READ, CANT_WRITE, REMOVE,
+		REMOVE | REMOVE_PEER, REMOVE_PEER, 0
+	};
+	zfeature_info_t *feature = &spa_feature_table[SPA_FEATURE_AVZ_V2];
+	vdev_t *root = spa->spa_root_vdev;
+	vdev_t *top = root->vdev_child[0];
+	VERIFY3U(top->vdev_children, ==, 3);
+	vdev_t *leaf = top->vdev_child[0], *peer = top->vdev_child[1];
+	VERIFY(!spa_feature_is_enabled(spa, SPA_FEATURE_AVZ_V2));
+	VERIFY0(root->vdev_root_zap);
+	nvlist_t *props = fnvlist_alloc();
+	fnvlist_add_uint64(props, "feature@vdev_zaps_v2", 0);
+	VERIFY0(spa_prop_set(spa, props));
+	fnvlist_free(props);
+
+	/* First defer until recovery; then leave the active root ZAP alone. */
+	for (uint_t pass = 0; pass < 2; pass++) {
+		for (uint_t i = 0; i < ARRAY_SIZE(states); i++) {
+			uint64_t refcount, zap = root->vdev_root_zap;
+			spa_config_enter(spa, SCL_STATE, FTAG, RW_WRITER);
+			leaf->vdev_cant_read = (states[i] & CANT_READ) != 0;
+			leaf->vdev_cant_write = (states[i] & CANT_WRITE) != 0;
+			leaf->vdev_remove_wanted = (states[i] & REMOVE) != 0;
+			peer->vdev_remove_wanted =
+			    (states[i] & REMOVE_PEER) != 0;
+			vdev_state_dirty(top);
+			spa_config_exit(spa, SCL_STATE, FTAG);
+			txg_wait_synced(spa_get_dsl(spa), 0);
+			boolean_t active = pass != 0 || states[i] == 0;
+			VERIFY0(feature_get_refcount(spa, feature, &refcount));
+			VERIFY3U(refcount, ==, active);
+			if (active) {
+				VERIFY3U(root->vdev_root_zap, !=, 0);
+				if (zap != 0)
+					VERIFY3U(root->vdev_root_zap, ==, zap);
+				VERIFY0(zap_lookup_int(spa->spa_meta_objset,
+				    spa->spa_all_vdev_zaps,
+				    root->vdev_root_zap));
+			} else {
+				VERIFY0(root->vdev_root_zap);
+			}
+		}
+	}
+	(void) printf("Root ZAP state/recovery checks passed\n");
+}
+
 /*
  * Create a storage pool with the given name and initial vdev size.
  * Then test spa_freeze() functionality.
@@ -9113,7 +9183,7 @@ ztest_init(ztest_shared_t *zs)
 	 */
 	fnvlist_add_uint64(props,
 	    zpool_prop_to_name(ZPOOL_PROP_FAILUREMODE),
-	    getenv("ZTEST_AVZ_SCENARIO") != NULL ?
+	    ztest_vdev_zaps_test ?
 	    ZIO_FAILURE_MODE_CONTINUE :
 	    (MAXFAULTS(zs) ? ZIO_FAILURE_MODE_PANIC :
 	    ZIO_FAILURE_MODE_WAIT));
@@ -9134,7 +9204,7 @@ ztest_init(ztest_shared_t *zs)
 		char *buf;
 
 		if (!spa_feature_table[i].fi_zfs_mod_supported ||
-		    (getenv("ZTEST_AVZ_SCENARIO") != NULL &&
+		    (ztest_vdev_zaps_test &&
 		    i == SPA_FEATURE_AVZ_V2))
 			continue;
 
@@ -9165,91 +9235,11 @@ ztest_init(ztest_shared_t *zs)
 
 	VERIFY0(spa_open(ztest_opts.zo_pool, &spa, FTAG));
 	ztest_spa = spa;
-	if (getenv("ZTEST_AVZ_SCENARIO") != NULL) {
-		nvlist_t *features = fnvlist_alloc();
-		VERIFY3U(spa->spa_root_vdev->vdev_root_zap, ==, 0);
-		VERIFY(!spa_feature_is_enabled(spa, SPA_FEATURE_AVZ_V2));
-		fnvlist_add_uint64(features, "feature@vdev_zaps_v2", 0);
-		int error = spa_prop_set(spa, features);
-		fnvlist_free(features);
-		VERIFY0(error);
-		VERIFY(spa_feature_is_enabled(spa, SPA_FEATURE_AVZ_V2));
-		VERIFY(!spa_feature_is_active(spa, SPA_FEATURE_AVZ_V2));
-		const char *scenario = getenv("ZTEST_AVZ_SCENARIO");
-		boolean_t fault = strcmp(scenario, "healthy") != 0;
-		boolean_t ordered = strcmp(scenario, "ordered") == 0;
-		VERIFY(!fault || strcmp(scenario, "fault") == 0 ||
-		    strcmp(scenario, "remove") == 0 ||
-		    strcmp(scenario, "write") == 0 || ordered);
-		vdev_t *leaf = spa->spa_root_vdev->vdev_child[0];
-		while (!leaf->vdev_ops->vdev_op_leaf)
-			leaf = leaf->vdev_child[0];
-		vdev_t *peer = NULL;
-		if (ordered) {
-			VERIFY3U(leaf->vdev_parent->vdev_children, >=, 2);
-			peer = leaf->vdev_parent->vdev_child[1];
-			VERIFY(peer->vdev_ops->vdev_op_leaf);
-		}
-		spa_config_enter(spa, SCL_STATE, FTAG, RW_WRITER);
-		if (fault) {
-			leaf->vdev_cant_read = strcmp(scenario, "fault") == 0;
-			leaf->vdev_cant_write = strcmp(scenario, "write") == 0;
-			leaf->vdev_remove_wanted =
-			    strcmp(scenario, "remove") == 0 || ordered;
-		}
-		vdev_state_dirty(spa->spa_root_vdev->vdev_child[0]);
-		spa_config_exit(spa, SCL_STATE, FTAG);
-		txg_wait_synced(spa_get_dsl(spa), 0);
-		if (fault) {
-			VERIFY(!spa_feature_is_active(spa, SPA_FEATURE_AVZ_V2));
-			VERIFY3U(spa->spa_root_vdev->vdev_root_zap, ==, 0);
-			if (ordered) {
-				/* Second device disappears in the next sync. */
-				spa_config_enter(spa, SCL_STATE, FTAG,
-				    RW_WRITER);
-				peer->vdev_remove_wanted = B_TRUE;
-				vdev_state_dirty(leaf->vdev_top);
-				spa_config_exit(spa, SCL_STATE, FTAG);
-				txg_wait_synced(spa_get_dsl(spa), 0);
-				VERIFY(!spa_feature_is_active(spa,
-				    SPA_FEATURE_AVZ_V2));
-				VERIFY3U(spa->spa_root_vdev->vdev_root_zap,
-				    ==, 0);
-				/* Only the first disk returns. */
-				spa_config_enter(spa, SCL_STATE, FTAG,
-				    RW_WRITER);
-				leaf->vdev_remove_wanted = B_FALSE;
-				vdev_state_dirty(leaf->vdev_top);
-				spa_config_exit(spa, SCL_STATE, FTAG);
-				txg_wait_synced(spa_get_dsl(spa), 0);
-				VERIFY(!spa_feature_is_active(spa,
-				    SPA_FEATURE_AVZ_V2));
-				VERIFY3U(spa->spa_root_vdev->vdev_root_zap,
-				    ==, 0);
-				(void) printf("AVZ_ORDERED_REMOVAL_PASS\n");
-			}
-			(void) printf("AVZ_FAULT_TEST_DEFERRED_PASS mode=%s\n",
-			    scenario);
-			spa_config_enter(spa, SCL_STATE, FTAG, RW_WRITER);
-			leaf->vdev_cant_read = B_FALSE;
-			leaf->vdev_cant_write = B_FALSE;
-			leaf->vdev_remove_wanted = B_FALSE;
-			if (ordered)
-				peer->vdev_remove_wanted = B_FALSE;
-			vdev_state_dirty(spa->spa_root_vdev->vdev_child[0]);
-			spa_config_exit(spa, SCL_STATE, FTAG);
-			txg_wait_synced(spa_get_dsl(spa), 0);
-		}
-		VERIFY(spa_feature_is_active(spa, SPA_FEATURE_AVZ_V2));
-		VERIFY3U(spa->spa_root_vdev->vdev_root_zap, !=, 0);
-		VERIFY0(zap_lookup_int(spa->spa_meta_objset,
-		    spa->spa_all_vdev_zaps,
-		    spa->spa_root_vdev->vdev_root_zap));
-		(void) printf("AVZ_FAULT_TEST_HEALTHY_PASS root_zap=%llu\n",
-		    (unsigned long long)spa->spa_root_vdev->vdev_root_zap);
+	if (ztest_vdev_zaps_test) {
+		ztest_vdev_zaps(spa);
 		spa_close(spa, FTAG);
 		kernel_fini();
-		return;
+		goto out;
 	}
 	ztest_dmu_sync_blocksize_tests(spa);
 	zs->zs_metaslab_sz =
@@ -9265,6 +9255,7 @@ ztest_init(ztest_shared_t *zs)
 		ztest_run_zdb(zs->zs_guid);
 	}
 
+out:
 	(void) pthread_rwlock_destroy(&ztest_name_lock);
 	mutex_destroy(&ztest_vdev_lock);
 	mutex_destroy(&ztest_checkpoint_lock);
@@ -9560,6 +9551,11 @@ main(int argc, char **argv)
 	    KM_SLEEP);
 	zs = ztest_shared;
 
+	if (ztest_vdev_zaps_test) {
+		ztest_run_init();
+		return (0);
+	}
+
 	if (fd_data_str) {
 		metaslab_force_ganging = ztest_opts.zo_metaslab_force_ganging;
 		metaslab_df_alloc_threshold =
@@ -9623,11 +9619,6 @@ main(int argc, char **argv)
 		VERIFY(!exec_child(NULL, NULL, B_FALSE, NULL));
 	}
 	zs->zs_do_init = B_FALSE;
-
-	if (getenv("ZTEST_AVZ_SCENARIO") != NULL) {
-		(void) printf("AVZ_FAULT_TEST_FOCUSED_INIT_DONE\n");
-		return (0);
-	}
 
 	zs->zs_proc_start = gethrtime();
 	zs->zs_proc_stop = zs->zs_proc_start + ztest_opts.zo_time * NANOSEC;

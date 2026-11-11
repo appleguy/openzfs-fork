@@ -3760,10 +3760,8 @@ vdev_create_link_zap(vdev_t *vd, dmu_tx_t *tx)
 }
 
 /*
- * Creating the optional root-vdev ZAP needs existing MOS metadata to be
- * readable.  After a device disappears, a state change can cause a config
- * sync before the device-removal handling has finished.  In that case leave
- * feature activation pending rather than perform optional metadata I/O.
+ * A removal-driven config sync must not start optional MOS updates after
+ * backing devices have become unavailable.
  */
 static boolean_t
 vdev_tree_usable_for_root_zap(vdev_t *vd)
@@ -3800,24 +3798,18 @@ vdev_construct_zaps(vdev_t *vd, dmu_tx_t *tx)
 				vdev_zap_allocation_data(vd, tx);
 		}
 	}
+	/*
+	 * Degraded/offlined pools stay enabled but inactive; root properties
+	 * return EINVAL until a healthy config sync initializes the root ZAP.
+	 * Already-active features still require their metadata to be present.
+	 */
 	if (vd->vdev_ops == &vdev_root_ops && vd->vdev_root_zap == 0 &&
-	    spa_feature_is_enabled(vd->vdev_spa, SPA_FEATURE_AVZ_V2)) {
-		/*
-		 * Do not begin optional first-time initialization while a
-		 * device is inaccessible.  The feature stays enabled but
-		 * inactive until a later healthy config sync/import.  On a
-		 * degraded pool, root-vdev properties remain unavailable
-		 * (EINVAL) until initialization, as before the upgrade.
-		 * If the feature is already active, this is not optional.
-		 */
-		boolean_t active = spa_feature_is_active(vd->vdev_spa,
-		    SPA_FEATURE_AVZ_V2);
-		if (active || vdev_tree_usable_for_root_zap(vd)) {
-			if (!active)
-				spa_feature_incr(vd->vdev_spa,
-				    SPA_FEATURE_AVZ_V2, tx);
-			vd->vdev_root_zap = vdev_create_link_zap(vd, tx);
-		}
+	    spa_feature_is_enabled(vd->vdev_spa, SPA_FEATURE_AVZ_V2) &&
+	    (spa_feature_is_active(vd->vdev_spa, SPA_FEATURE_AVZ_V2) ||
+	    vdev_tree_usable_for_root_zap(vd))) {
+		if (!spa_feature_is_active(vd->vdev_spa, SPA_FEATURE_AVZ_V2))
+			spa_feature_incr(vd->vdev_spa, SPA_FEATURE_AVZ_V2, tx);
+		vd->vdev_root_zap = vdev_create_link_zap(vd, tx);
 	}
 
 	for (uint64_t i = 0; i < vd->vdev_children; i++) {

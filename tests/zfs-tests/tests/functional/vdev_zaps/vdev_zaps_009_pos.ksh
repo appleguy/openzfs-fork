@@ -20,37 +20,14 @@
 
 verify_runnable "global"
 
-# ztest spawns itself during initialization: give it an absolute executable.
-ZTEST_BIN=$(whence -p ztest)
-[[ -x "$ZTEST_BIN" ]] || log_fail "ztest executable unavailable"
 ZTEST_AVZ_DIR="$TEST_BASE_DIR/ztest-avz-$$"
-
 function cleanup
 {
-    rm -rf -- "$ZTEST_AVZ_DIR"
+	rm -rf -- "$ZTEST_AVZ_DIR"
 }
-
-log_assert "Root-vdev ZAP activation defers on unavailable vdevs and retries"
 log_onexit cleanup
 
-# ztest may re-exec itself by basename, including via a libtool wrapper.
-log_must cd "$(dirname "$ZTEST_BIN")"
-
-for scenario in healthy fault remove write ordered; do
-    workdir="$ZTEST_AVZ_DIR/$scenario"
-    logfile="$ZTEST_AVZ_DIR/$scenario.log"
-    log_must mkdir -p "$workdir"
-    log_must env ZTEST_AVZ_SCENARIO="$scenario" "$ZTEST_BIN" \
-        -T 1 -P 1 -k 0 -v 1 -m 2 -r 2 -K raidz -d 1 -t 1 -s 64M \
-        -p "ztestavz${scenario}$$" -f "$workdir" > "$logfile" 2>&1
-    log_must grep -q 'AVZ_FAULT_TEST_HEALTHY_PASS' "$logfile"
-    if [[ "$scenario" != healthy ]]; then
-        log_must grep -q "AVZ_FAULT_TEST_DEFERRED_PASS mode=$scenario" \
-            "$logfile"
-    fi
-    if [[ "$scenario" == ordered ]]; then
-        log_must grep -q 'AVZ_ORDERED_REMOVAL_PASS' "$logfile"
-    fi
-done
-
-log_pass "Root ZAP deferred and linked after vdev recovery"
+log_assert "Root ZAP activation defers until recovery and stays active"
+log_must mkdir -p "$ZTEST_AVZ_DIR"
+log_must ztest --vdev-zaps -s 64M -p "ztestavz$$" -f "$ZTEST_AVZ_DIR"
+log_pass "Root ZAP deferral, recovery and active-state checks passed"
